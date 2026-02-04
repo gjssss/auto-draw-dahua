@@ -1,25 +1,27 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-
-type Vertex = {
-  x: number;
-  y: number;
-};
-
-type RectData = {
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
-  vertices: Vertex[];
-};
-
-type Stroke = Vertex[];
+import { DebugPanel } from "./components/DebugPanel";
+import { bwGridToDotGrid, dotGridToStrokesAndEvents } from "./lib/gridToPath";
+import { imageFileToBWGrid } from "./lib/imageToBWGrid";
+import type {
+  BWGrid,
+  CanvasSize,
+  DotGrid,
+  MouseEventItem,
+  RectData,
+  SegmentsData,
+  Stroke,
+  StrokeSegment,
+  Vertex,
+} from "./lib/types";
 
 const STORAGE_KEY = "auto-draw:rect-vertices";
 const MIN_STROKE_WIDTH = 8;
 const MAX_STROKE_WIDTH = 20;
+const PIXEL_BLOCK_SIZE = 6;
+const BW_THRESHOLD = 34;
+const DOT_BLOCK_SIZE = 3;
 
 function parsePercentValue(value: unknown): number | null {
   const raw =
@@ -179,14 +181,33 @@ function parseStrokes(data: unknown): Stroke[] {
   return strokes;
 }
 
+function getCanvasSize(ratio: number): CanvasSize {
+  const BOX_SIZE = 700;
+  const width =
+    ratio >= 1 ? BOX_SIZE : Math.max(1, Math.round(BOX_SIZE * ratio));
+  const height =
+    ratio >= 1 ? Math.max(1, Math.round(BOX_SIZE / ratio)) : BOX_SIZE;
+
+  return { width, height };
+}
+
 export default function Home() {
   const [rect, setRect] = useState<RectData | null>(null);
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [imageError, setImageError] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [generatedEvents, setGeneratedEvents] = useState<MouseEventItem[]>([]);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugCount, setDebugCount] = useState(0);
+  const [bwGrid, setBwGrid] = useState<BWGrid | null>(null);
+  const [dotGrid, setDotGrid] = useState<DotGrid | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const bwCanvasRef = useRef<HTMLCanvasElement>(null);
 
   const ratio = useMemo(() => {
     if (!rect) {
@@ -196,6 +217,55 @@ export default function Home() {
     const height = rect.maxY - rect.minY;
     return width / height;
   }, [rect]);
+
+  const isDev = process.env.NODE_ENV === "development";
+  const canvasSize = useMemo(() => getCanvasSize(ratio), [ratio]);
+
+  const segmentsData = useMemo<SegmentsData | null>(() => {
+    if (!rect || strokes.length === 0) {
+      return null;
+    }
+
+    const rectWidth = rect.maxX - rect.minX;
+    const rectHeight = rect.maxY - rect.minY;
+    const scaleX = canvasSize.width / rectWidth;
+    const scaleY = canvasSize.height / rectHeight;
+
+    const segments: StrokeSegment[] = [];
+
+    for (let sIndex = 0; sIndex < strokes.length; sIndex += 1) {
+      const stroke = strokes[sIndex];
+      if (stroke.length < 2) {
+        continue;
+      }
+
+      for (let i = 1; i < stroke.length; i += 1) {
+        const prev = stroke[i - 1];
+        const next = stroke[i];
+        const x1 = (prev.x - rect.minX) * scaleX;
+        const y1 = (prev.y - rect.minY) * scaleY;
+        const x2 = (next.x - rect.minX) * scaleX;
+        const y2 = (next.y - rect.minY) * scaleY;
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const d = Math.hypot(dx, dy);
+        segments.push({ x1, y1, x2, y2, d, strokeIndex: sIndex });
+      }
+    }
+
+    if (segments.length === 0) {
+      return null;
+    }
+
+    let minD = Infinity;
+    let maxD = -Infinity;
+    for (const seg of segments) {
+      minD = Math.min(minD, seg.d);
+      maxD = Math.max(maxD, seg.d);
+    }
+
+    return { segments, minD, maxD };
+  }, [rect, strokes, canvasSize]);
 
   useEffect(() => {
     const stored = parseStoredRect(localStorage.getItem(STORAGE_KEY));
@@ -214,11 +284,7 @@ export default function Home() {
       return;
     }
 
-    const BOX_SIZE = 700;
-    const width =
-      ratio >= 1 ? BOX_SIZE : Math.max(1, Math.round(BOX_SIZE * ratio));
-    const height =
-      ratio >= 1 ? Math.max(1, Math.round(BOX_SIZE / ratio)) : BOX_SIZE;
+    const { width, height } = canvasSize;
 
     canvas.width = width;
     canvas.height = height;
@@ -230,57 +296,20 @@ export default function Home() {
 
     ctx.clearRect(0, 0, width, height);
 
-    if (strokes.length === 0) {
+    if (!segmentsData) {
       return;
     }
-
-    const rectWidth = rect.maxX - rect.minX;
-    const rectHeight = rect.maxY - rect.minY;
-    const scaleX = width / rectWidth;
-    const scaleY = height / rectHeight;
 
     ctx.strokeStyle = "#111111";
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
 
-    const segments: { x1: number; y1: number; x2: number; y2: number; d: number }[] = [];
-
-    for (const stroke of strokes) {
-      if (stroke.length < 2) {
-        continue;
-      }
-
-      for (let i = 1; i < stroke.length; i += 1) {
-        const prev = stroke[i - 1];
-        const next = stroke[i];
-        const x1 = (prev.x - rect.minX) * scaleX;
-        const y1 = (prev.y - rect.minY) * scaleY;
-        const x2 = (next.x - rect.minX) * scaleX;
-        const y2 = (next.y - rect.minY) * scaleY;
-        const dx = x2 - x1;
-        const dy = y2 - y1;
-        const d = Math.hypot(dx, dy);
-        segments.push({ x1, y1, x2, y2, d });
-      }
-    }
-
-    if (segments.length === 0) {
-      return;
-    }
-
-    let minD = Infinity;
-    let maxD = -Infinity;
-    for (const seg of segments) {
-      minD = Math.min(minD, seg.d);
-      maxD = Math.max(maxD, seg.d);
-    }
-
     const minWidth = MIN_STROKE_WIDTH;
     const maxWidth = MAX_STROKE_WIDTH;
-    const span = Math.max(1e-6, maxD - minD);
+    const span = Math.max(1e-6, segmentsData.maxD - segmentsData.minD);
 
-    for (const seg of segments) {
-      const t = (seg.d - minD) / span;
+    for (const seg of segmentsData.segments) {
+      const t = (seg.d - segmentsData.minD) / span;
       const width = maxWidth - t * (maxWidth - minWidth);
       ctx.lineWidth = width;
       ctx.beginPath();
@@ -288,7 +317,47 @@ export default function Home() {
       ctx.lineTo(seg.x2, seg.y2);
       ctx.stroke();
     }
-  }, [rect, ratio, strokes]);
+  }, [rect, canvasSize, segmentsData]);
+
+  useEffect(() => {
+    if (!bwGrid) {
+      return;
+    }
+
+    const canvas = bwCanvasRef.current;
+    if (!canvas) {
+      return;
+    }
+
+    const width = Math.max(1, bwGrid.width * PIXEL_BLOCK_SIZE);
+    const height = Math.max(1, bwGrid.height * PIXEL_BLOCK_SIZE);
+    canvas.width = width;
+    canvas.height = height;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = "#000000";
+
+    for (let y = 0; y < bwGrid.height; y += 1) {
+      for (let x = 0; x < bwGrid.width; x += 1) {
+        if (!bwGrid.data[y][x]) {
+          continue;
+        }
+        ctx.fillRect(
+          x * PIXEL_BLOCK_SIZE,
+          y * PIXEL_BLOCK_SIZE,
+          PIXEL_BLOCK_SIZE,
+          PIXEL_BLOCK_SIZE
+        );
+      }
+    }
+  }, [bwGrid]);
 
   const handleFilePick = () => {
     setError(null);
@@ -298,6 +367,27 @@ export default function Home() {
   const handlePreviewPick = () => {
     setPreviewError(null);
     previewInputRef.current?.click();
+  };
+
+  const handleImagePick = () => {
+    setImageError(null);
+    imageInputRef.current?.click();
+  };
+
+  const handleDownload = () => {
+    if (generatedEvents.length === 0) {
+      return;
+    }
+
+    const blob = new Blob([JSON.stringify(generatedEvents, null, 2)], {
+      type: "text/plain;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "auto-draw.txt";
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleFileChange = async (
@@ -322,6 +412,10 @@ export default function Home() {
 
       localStorage.setItem(STORAGE_KEY, JSON.stringify(computed));
       setRect(computed);
+      setGeneratedEvents([]);
+      setStrokes([]);
+      setBwGrid(null);
+      setDotGrid(null);
     } catch {
       setError("文件内容不是有效 JSON。");
     } finally {
@@ -356,9 +450,65 @@ export default function Home() {
       }
 
       setStrokes(parsed);
+      setGeneratedEvents([]);
+      setBwGrid(null);
+      setDotGrid(null);
     } catch {
       setPreviewError("文件内容不是有效 JSON。");
     } finally {
+      event.target.value = "";
+    }
+  };
+
+  const handleImageChange = async (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setImageError(null);
+
+    if (!rect) {
+      setImageError("请先上传区域文件。");
+      event.target.value = "";
+      return;
+    }
+
+    setIsProcessing(true);
+
+    try {
+      const { width: canvasWidth, height: canvasHeight } = canvasSize;
+      const gridW = Math.max(1, Math.floor(canvasWidth / PIXEL_BLOCK_SIZE));
+      const gridH = Math.max(1, Math.floor(canvasHeight / PIXEL_BLOCK_SIZE));
+      const grid = await imageFileToBWGrid(file, {
+        gridWidth: gridW,
+        gridHeight: gridH,
+        threshold: BW_THRESHOLD,
+      });
+      setBwGrid(grid);
+
+      const dots = bwGridToDotGrid(grid, DOT_BLOCK_SIZE);
+      setDotGrid(dots);
+
+      const { strokes: dfsStrokes, events } = dotGridToStrokesAndEvents(
+        dots,
+        rect
+      );
+
+      if (dfsStrokes.length === 0) {
+        setImageError("未生成有效的轨迹。");
+        return;
+      }
+
+      setGeneratedEvents(events);
+      setStrokes(dfsStrokes);
+      setDebugCount(dfsStrokes.length);
+    } catch {
+      setImageError("图片处理失败，请重试。");
+    } finally {
+      setIsProcessing(false);
       event.target.value = "";
     }
   };
@@ -381,6 +531,31 @@ export default function Home() {
           >
             上传预览
           </button>
+          <button
+            type="button"
+            onClick={handleImagePick}
+            disabled={isProcessing}
+            className="h-10 rounded border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-900 transition hover:border-zinc-400 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            上传图片
+          </button>
+          <button
+            type="button"
+            onClick={handleDownload}
+            disabled={generatedEvents.length === 0}
+            className="h-10 rounded border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-900 transition hover:border-zinc-400 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            下载
+          </button>
+          {isDev ? (
+            <button
+              type="button"
+              onClick={() => setDebugOpen((prev) => !prev)}
+              className="h-10 rounded border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-900 transition hover:border-zinc-400"
+            >
+              {debugOpen ? "关闭调试" : "打开调试"}
+            </button>
+          ) : null}
           <input
             ref={fileInputRef}
             type="file"
@@ -395,6 +570,13 @@ export default function Home() {
             className="hidden"
             onChange={handlePreviewChange}
           />
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={handleImageChange}
+          />
         </div>
 
         {error ? (
@@ -403,13 +585,42 @@ export default function Home() {
         {previewError ? (
           <div className="text-sm text-red-600">{previewError}</div>
         ) : null}
+        {imageError ? (
+          <div className="text-sm text-red-600">{imageError}</div>
+        ) : null}
 
         {rect ? (
-          <div className="flex h-[700px] w-[700px] items-center justify-center">
-            <canvas
-              ref={canvasRef}
-              className="block border border-zinc-300"
-            />
+          <div className="flex flex-col items-start gap-4">
+            <div className="flex h-[700px] w-[700px] items-center justify-center">
+              <canvas
+                ref={canvasRef}
+                className="block border border-zinc-300"
+              />
+            </div>
+            {isDev ? (
+              <DebugPanel
+                open={debugOpen}
+                strokesLength={strokes.length}
+                debugCount={debugCount}
+                onDebugCountChange={setDebugCount}
+                segmentsData={segmentsData}
+                canvasSize={canvasSize}
+                minStrokeWidth={MIN_STROKE_WIDTH}
+                maxStrokeWidth={MAX_STROKE_WIDTH}
+                dotGrid={dotGrid}
+              />
+            ) : null}
+            {bwGrid ? (
+              <div className="flex flex-col gap-2">
+                <div className="text-sm text-zinc-700">黑白方格结果</div>
+                <div className="flex h-[700px] w-[700px] items-center justify-center">
+                  <canvas
+                    ref={bwCanvasRef}
+                    className="block border border-zinc-300"
+                  />
+                </div>
+              </div>
+            ) : null}
           </div>
         ) : (
           <div className="text-sm text-zinc-600">请上传区域</div>
