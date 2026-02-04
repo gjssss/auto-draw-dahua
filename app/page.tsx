@@ -1,18 +1,18 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DebugPanel } from "./components/DebugPanel";
 import { bwGridToDotGrid, dotGridToStrokesAndEvents } from "./lib/gridToPath";
 import { imageFileToBWGrid } from "./lib/imageToBWGrid";
+import { buildSegmentsData } from "./lib/strokeSegments";
 import type {
   BWGrid,
   CanvasSize,
   DotGrid,
   MouseEventItem,
   RectData,
-  SegmentsData,
   Stroke,
-  StrokeSegment,
   Vertex,
 } from "./lib/types";
 
@@ -221,51 +221,10 @@ export default function Home() {
   const isDev = process.env.NODE_ENV === "development";
   const canvasSize = useMemo(() => getCanvasSize(ratio), [ratio]);
 
-  const segmentsData = useMemo<SegmentsData | null>(() => {
-    if (!rect || strokes.length === 0) {
-      return null;
-    }
-
-    const rectWidth = rect.maxX - rect.minX;
-    const rectHeight = rect.maxY - rect.minY;
-    const scaleX = canvasSize.width / rectWidth;
-    const scaleY = canvasSize.height / rectHeight;
-
-    const segments: StrokeSegment[] = [];
-
-    for (let sIndex = 0; sIndex < strokes.length; sIndex += 1) {
-      const stroke = strokes[sIndex];
-      if (stroke.length < 2) {
-        continue;
-      }
-
-      for (let i = 1; i < stroke.length; i += 1) {
-        const prev = stroke[i - 1];
-        const next = stroke[i];
-        const x1 = (prev.x - rect.minX) * scaleX;
-        const y1 = (prev.y - rect.minY) * scaleY;
-        const x2 = (next.x - rect.minX) * scaleX;
-        const y2 = (next.y - rect.minY) * scaleY;
-        const dx = x2 - x1;
-        const dy = y2 - y1;
-        const d = Math.hypot(dx, dy);
-        segments.push({ x1, y1, x2, y2, d, strokeIndex: sIndex });
-      }
-    }
-
-    if (segments.length === 0) {
-      return null;
-    }
-
-    let minD = Infinity;
-    let maxD = -Infinity;
-    for (const seg of segments) {
-      minD = Math.min(minD, seg.d);
-      maxD = Math.max(maxD, seg.d);
-    }
-
-    return { segments, minD, maxD };
-  }, [rect, strokes, canvasSize]);
+  const segmentsData = useMemo(
+    () => (rect ? buildSegmentsData(strokes, rect, canvasSize) : null),
+    [rect, strokes, canvasSize]
+  );
 
   useEffect(() => {
     const stored = parseStoredRect(localStorage.getItem(STORAGE_KEY));
@@ -517,6 +476,12 @@ export default function Home() {
     <main className="min-h-screen bg-white text-black">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-8">
         <div className="flex flex-wrap items-center gap-3">
+          <Link
+            href="/manual"
+            className="inline-flex h-10 items-center rounded border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-900 transition hover:border-zinc-400"
+          >
+            手动绘制
+          </Link>
           <button
             type="button"
             onClick={handleFilePick}
