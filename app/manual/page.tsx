@@ -17,10 +17,40 @@ type StoredImage = {
   height: number;
 };
 
+type SamplePoint = {
+  point: Vertex;
+  px: number;
+  py: number;
+  nx: number;
+  ny: number;
+  boxWidth: number;
+  boxHeight: number;
+};
+
+type DebugStats = {
+  boxWidth: number;
+  boxHeight: number;
+  pxMin: number;
+  pxMax: number;
+  pyMin: number;
+  pyMax: number;
+  nxMin: number;
+  nxMax: number;
+  nyMin: number;
+  nyMax: number;
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+  samples: number;
+};
+
 const STORAGE_KEY = "auto-draw:rect-vertices";
 const MIN_STROKE_WIDTH = 8;
 const MAX_STROKE_WIDTH = 20;
 const BW_THRESHOLD = 34;
+const CORRECTION_X = 0.8;
+const CORRECTION_Y = 0.62;
 
 function parseStoredRect(raw: string | null): RectData | null {
   if (!raw) {
@@ -58,6 +88,37 @@ function formatPercent(value: number) {
   return `${Number(value.toFixed(6))}%`;
 }
 
+function formatDebugNumber(value: number, digits = 2) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "--";
+}
+
+function formatCoverage(range: number, total: number) {
+  if (!Number.isFinite(range) || !Number.isFinite(total) || total <= 0) {
+    return "--";
+  }
+  return ((range / total) * 100).toFixed(1);
+}
+
+function createEmptyStats(): DebugStats {
+  return {
+    boxWidth: 0,
+    boxHeight: 0,
+    pxMin: Infinity,
+    pxMax: -Infinity,
+    pyMin: Infinity,
+    pyMax: -Infinity,
+    nxMin: Infinity,
+    nxMax: -Infinity,
+    nyMin: Infinity,
+    nyMax: -Infinity,
+    xMin: Infinity,
+    xMax: -Infinity,
+    yMin: Infinity,
+    yMax: -Infinity,
+    samples: 0,
+  };
+}
+
 export default function ManualPage() {
   const [rect, setRect] = useState<RectData | null>(null);
   const [processedImage, setProcessedImage] = useState<StoredImage | null>(
@@ -67,6 +128,8 @@ export default function ManualPage() {
   const [error, setError] = useState<string | null>(null);
   const [recordedStrokes, setRecordedStrokes] = useState<Stroke[]>([]);
   const [generatedEvents, setGeneratedEvents] = useState<MouseEventItem[]>([]);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debugStats, setDebugStats] = useState<DebugStats>(createEmptyStats);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -76,9 +139,11 @@ export default function ManualPage() {
   const strokesRef = useRef<Stroke[]>([]);
   const currentStrokeRef = useRef<Stroke | null>(null);
   const latestPointRef = useRef<Vertex | null>(null);
+  const latestSampleRef = useRef<SamplePoint | null>(null);
   const intervalRef = useRef<number | null>(null);
   const isDrawingRef = useRef(false);
   const recordingRef = useRef(false);
+  const debugStatsRef = useRef<DebugStats>(createEmptyStats());
 
   const ratio = useMemo(() => {
     if (!rect) {
@@ -90,6 +155,44 @@ export default function ManualPage() {
   }, [rect]);
 
   const canvasSize = useMemo(() => getCanvasSize(ratio), [ratio]);
+  const isDev = process.env.NODE_ENV === "development";
+
+  const resetDebugStats = useCallback(() => {
+    const fresh = createEmptyStats();
+    debugStatsRef.current = fresh;
+    setDebugStats(fresh);
+  }, []);
+
+  const applySampleToStats = useCallback(
+    (sample: SamplePoint) => {
+      if (!debugOpen) {
+        return;
+      }
+
+      const stats = debugStatsRef.current;
+      stats.boxWidth = sample.boxWidth;
+      stats.boxHeight = sample.boxHeight;
+      stats.samples += 1;
+
+      stats.pxMin = Math.min(stats.pxMin, sample.px);
+      stats.pxMax = Math.max(stats.pxMax, sample.px);
+      stats.pyMin = Math.min(stats.pyMin, sample.py);
+      stats.pyMax = Math.max(stats.pyMax, sample.py);
+
+      stats.nxMin = Math.min(stats.nxMin, sample.nx);
+      stats.nxMax = Math.max(stats.nxMax, sample.nx);
+      stats.nyMin = Math.min(stats.nyMin, sample.ny);
+      stats.nyMax = Math.max(stats.nyMax, sample.ny);
+
+      stats.xMin = Math.min(stats.xMin, sample.point.x);
+      stats.xMax = Math.max(stats.xMax, sample.point.x);
+      stats.yMin = Math.min(stats.yMin, sample.point.y);
+      stats.yMax = Math.max(stats.yMax, sample.point.y);
+
+      setDebugStats({ ...stats });
+    },
+    [debugOpen]
+  );
 
   useEffect(() => {
     const stored = parseStoredRect(localStorage.getItem(STORAGE_KEY));
@@ -321,7 +424,9 @@ export default function ManualPage() {
     img.src = processedImage.dataUrl;
   }, [processedImage, drawMainCanvas, recordedStrokes]);
 
-  const toVertexFromEvent = (event: React.PointerEvent<HTMLCanvasElement>) => {
+  const getSampleFromEvent = (
+    event: React.PointerEvent<HTMLCanvasElement>
+  ): SamplePoint | null => {
     if (!rect) {
       return null;
     }
@@ -334,9 +439,24 @@ export default function ManualPage() {
     const py = Math.min(Math.max(event.clientY - box.top, 0), box.height);
     const rectWidth = rect.maxX - rect.minX;
     const rectHeight = rect.maxY - rect.minY;
+    const rawNx = box.width === 0 ? 0 : px / box.width - 0.5;
+    const rawNy = box.height === 0 ? 0 : py / box.height - 0.5;
+    const nx = Math.max(-0.5, Math.min(0.5, rawNx));
+    const ny = Math.max(-0.5, Math.min(0.5, rawNy));
+    const centerX = (rect.minX + rect.maxX) / 2;
+    const centerY = (rect.minY + rect.maxY) / 2;
+    const point = {
+      x: centerX + (nx * rectWidth) / CORRECTION_X,
+      y: centerY + (ny * rectHeight) / CORRECTION_Y,
+    };
     return {
-      x: rect.minX + (px / box.width) * rectWidth,
-      y: rect.minY + (py / box.height) * rectHeight,
+      point,
+      px,
+      py,
+      nx,
+      ny,
+      boxWidth: box.width,
+      boxHeight: box.height,
     };
   };
 
@@ -345,15 +465,17 @@ export default function ManualPage() {
       return;
     }
 
-    const point = toVertexFromEvent(event);
-    if (!point) {
+    const sample = getSampleFromEvent(event);
+    if (!sample) {
       return;
     }
 
     event.currentTarget.setPointerCapture(event.pointerId);
     isDrawingRef.current = true;
-    latestPointRef.current = point;
-    currentStrokeRef.current = [point];
+    latestPointRef.current = sample.point;
+    latestSampleRef.current = sample;
+    currentStrokeRef.current = [sample.point];
+    applySampleToStats(sample);
     drawMainCanvas([...strokesRef.current, currentStrokeRef.current]);
   };
 
@@ -362,12 +484,13 @@ export default function ManualPage() {
       return;
     }
 
-    const point = toVertexFromEvent(event);
-    if (!point) {
+    const sample = getSampleFromEvent(event);
+    if (!sample) {
       return;
     }
 
-    latestPointRef.current = point;
+    latestPointRef.current = sample.point;
+    latestSampleRef.current = sample;
   };
 
   const finalizeStroke = () => {
@@ -414,7 +537,9 @@ export default function ManualPage() {
     strokesRef.current = [];
     currentStrokeRef.current = null;
     latestPointRef.current = null;
+    latestSampleRef.current = null;
     drawMainCanvas([]);
+    resetDebugStats();
 
     if (intervalRef.current) {
       window.clearInterval(intervalRef.current);
@@ -425,6 +550,7 @@ export default function ManualPage() {
         return;
       }
       const point = latestPointRef.current;
+      const sample = latestSampleRef.current;
       const stroke = currentStrokeRef.current;
       if (!point || !stroke) {
         return;
@@ -433,6 +559,9 @@ export default function ManualPage() {
       if (!last || last.x !== point.x || last.y !== point.y) {
         stroke.push(point);
         drawMainCanvas([...strokesRef.current, stroke]);
+      }
+      if (sample) {
+        applySampleToStats(sample);
       }
     }, 25);
   };
@@ -575,6 +704,59 @@ export default function ManualPage() {
         {error ? <div className="text-sm text-red-600">{error}</div> : null}
         {!rect ? (
           <div className="text-sm text-zinc-600">请先在首页上传区域</div>
+        ) : null}
+        {isDev ? (
+          <button
+            type="button"
+            onClick={() => setDebugOpen((prev) => !prev)}
+            className="h-9 w-fit rounded border border-zinc-300 bg-white px-3 text-xs font-medium text-zinc-900 transition hover:border-zinc-400"
+          >
+            {debugOpen ? "关闭调试" : "打开调试"}
+          </button>
+        ) : null}
+        {isDev && debugOpen ? (
+          <div className="w-full max-w-3xl rounded border border-zinc-200 bg-zinc-50 p-3 text-xs text-zinc-800">
+            <div className="font-medium">录制调试信息</div>
+            <div>采样数: {debugStats.samples}</div>
+            <div>
+              画布尺寸: {formatDebugNumber(debugStats.boxWidth, 1)} ×{" "}
+              {formatDebugNumber(debugStats.boxHeight, 1)}
+            </div>
+            <div>
+              px范围: {formatDebugNumber(debugStats.pxMin, 2)} ~{" "}
+              {formatDebugNumber(debugStats.pxMax, 2)} (覆盖{" "}
+              {formatCoverage(
+                debugStats.pxMax - debugStats.pxMin,
+                debugStats.boxWidth
+              )}
+              %)
+            </div>
+            <div>
+              py范围: {formatDebugNumber(debugStats.pyMin, 2)} ~{" "}
+              {formatDebugNumber(debugStats.pyMax, 2)} (覆盖{" "}
+              {formatCoverage(
+                debugStats.pyMax - debugStats.pyMin,
+                debugStats.boxHeight
+              )}
+              %)
+            </div>
+            <div>
+              nx范围: {formatDebugNumber(debugStats.nxMin, 4)} ~{" "}
+              {formatDebugNumber(debugStats.nxMax, 4)}
+            </div>
+            <div>
+              ny范围: {formatDebugNumber(debugStats.nyMin, 4)} ~{" "}
+              {formatDebugNumber(debugStats.nyMax, 4)}
+            </div>
+            <div>
+              映射x范围: {formatDebugNumber(debugStats.xMin, 6)} ~{" "}
+              {formatDebugNumber(debugStats.xMax, 6)}
+            </div>
+            <div>
+              映射y范围: {formatDebugNumber(debugStats.yMin, 6)} ~{" "}
+              {formatDebugNumber(debugStats.yMax, 6)}
+            </div>
+          </div>
         ) : null}
 
         <div className="flex flex-col items-start gap-4">
