@@ -119,6 +119,23 @@ function createEmptyStats(): DebugStats {
   };
 }
 
+function applyCorrectionToPoint(point: Vertex, rect: RectData): Vertex {
+  const centerX = (rect.minX + rect.maxX) / 2;
+  const centerY = (rect.minY + rect.maxY) / 2;
+  const rectWidth = rect.maxX - rect.minX;
+  const rectHeight = rect.maxY - rect.minY;
+
+  const rawNx = rectWidth === 0 ? 0 : (point.x - centerX) / rectWidth;
+  const rawNy = rectHeight === 0 ? 0 : (point.y - centerY) / rectHeight;
+  const nx = Math.max(-0.5, Math.min(0.5, rawNx));
+  const ny = Math.max(-0.5, Math.min(0.5, rawNy));
+
+  return {
+    x: centerX + (nx * rectWidth) / CORRECTION_X,
+    y: centerY + (ny * rectHeight) / CORRECTION_Y,
+  };
+}
+
 export default function ManualPage() {
   const [rect, setRect] = useState<RectData | null>(null);
   const [processedImage, setProcessedImage] = useState<StoredImage | null>(
@@ -439,15 +456,11 @@ export default function ManualPage() {
     const py = Math.min(Math.max(event.clientY - box.top, 0), box.height);
     const rectWidth = rect.maxX - rect.minX;
     const rectHeight = rect.maxY - rect.minY;
-    const rawNx = box.width === 0 ? 0 : px / box.width - 0.5;
-    const rawNy = box.height === 0 ? 0 : py / box.height - 0.5;
-    const nx = Math.max(-0.5, Math.min(0.5, rawNx));
-    const ny = Math.max(-0.5, Math.min(0.5, rawNy));
-    const centerX = (rect.minX + rect.maxX) / 2;
-    const centerY = (rect.minY + rect.maxY) / 2;
+    const nx = box.width === 0 ? 0 : px / box.width;
+    const ny = box.height === 0 ? 0 : py / box.height;
     const point = {
-      x: centerX + (nx * rectWidth) / CORRECTION_X,
-      y: centerY + (ny * rectHeight) / CORRECTION_Y,
+      x: rect.minX + nx * rectWidth,
+      y: rect.minY + ny * rectHeight,
     };
     return {
       point,
@@ -459,6 +472,18 @@ export default function ManualPage() {
       boxHeight: box.height,
     };
   };
+
+  const appendLatestPointIfNeeded = useCallback(() => {
+    const stroke = currentStrokeRef.current;
+    const point = latestPointRef.current;
+    if (!stroke || !point) {
+      return;
+    }
+    const last = stroke[stroke.length - 1];
+    if (!last || last.x !== point.x || last.y !== point.y) {
+      stroke.push(point);
+    }
+  }, []);
 
   const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!recordingRef.current || !rect || !processedImage) {
@@ -507,10 +532,19 @@ export default function ManualPage() {
     setRecordedStrokes(strokesRef.current);
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (!recordingRef.current || !isDrawingRef.current) {
       return;
     }
+
+    const sample = getSampleFromEvent(event);
+    if (sample) {
+      latestPointRef.current = sample.point;
+      latestSampleRef.current = sample;
+      applySampleToStats(sample);
+    }
+
+    appendLatestPointIfNeeded();
     finalizeStroke();
     drawMainCanvas(strokesRef.current);
   };
@@ -575,7 +609,13 @@ export default function ManualPage() {
     recordingRef.current = false;
 
     if (isDrawingRef.current) {
+      appendLatestPointIfNeeded();
       finalizeStroke();
+    }
+
+    if (!rect) {
+      setError("区域信息缺失，无法导出录制数据。");
+      return;
     }
 
     const strokes = strokesRef.current;
@@ -587,7 +627,7 @@ export default function ManualPage() {
       }
 
       if (events.length > 0) {
-        const start = stroke[0];
+        const start = applyCorrectionToPoint(stroke[0], rect);
         events.push([
           24,
           "EM",
@@ -597,7 +637,7 @@ export default function ManualPage() {
       }
 
       if (stroke.length === 1) {
-        const point = stroke[0];
+        const point = applyCorrectionToPoint(stroke[0], rect);
         events.push([
           24,
           "EM",
@@ -614,7 +654,7 @@ export default function ManualPage() {
       }
 
       for (let i = 0; i < stroke.length; i += 1) {
-        const point = stroke[i];
+        const point = applyCorrectionToPoint(stroke[i], rect);
         const action =
           i === 0
             ? "mouse left down"
