@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { resampleStrokesForExport } from "../lib/strokeResample";
 import { buildSegmentsData } from "../lib/strokeSegments";
 import type {
   CanvasSize,
@@ -51,6 +52,8 @@ const MAX_STROKE_WIDTH = 20;
 const BW_THRESHOLD = 34;
 const CORRECTION_X = 0.8;
 const CORRECTION_Y = 0.62;
+const MIN_RENDER_WIDTH = 0.5;
+const MAX_RENDER_WIDTH = 64;
 
 function parseStoredRect(raw: string | null): RectData | null {
   if (!raw) {
@@ -99,6 +102,10 @@ function formatCoverage(range: number, total: number) {
   return ((range / total) * 100).toFixed(1);
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function createEmptyStats(): DebugStats {
   return {
     boxWidth: 0,
@@ -145,6 +152,7 @@ export default function ManualPage() {
   const [error, setError] = useState<string | null>(null);
   const [recordedStrokes, setRecordedStrokes] = useState<Stroke[]>([]);
   const [generatedEvents, setGeneratedEvents] = useState<MouseEventItem[]>([]);
+  const [thicknessScale, setThicknessScale] = useState(1);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugStats, setDebugStats] = useState<DebugStats>(createEmptyStats);
 
@@ -261,15 +269,20 @@ export default function ManualPage() {
 
       for (const seg of data.segments) {
         const t = (seg.d - data.minD) / span;
-        const width = MAX_STROKE_WIDTH - t * (MAX_STROKE_WIDTH - MIN_STROKE_WIDTH);
-        ctx.lineWidth = width;
+        const baseWidth =
+          MAX_STROKE_WIDTH - t * (MAX_STROKE_WIDTH - MIN_STROKE_WIDTH);
+        ctx.lineWidth = clamp(
+          baseWidth * thicknessScale,
+          MIN_RENDER_WIDTH,
+          MAX_RENDER_WIDTH
+        );
         ctx.beginPath();
         ctx.moveTo(seg.x1, seg.y1);
         ctx.lineTo(seg.x2, seg.y2);
         ctx.stroke();
       }
     },
-    [rect, canvasSize]
+    [rect, canvasSize, thicknessScale]
   );
 
   const drawMainCanvas = useCallback(
@@ -619,9 +632,10 @@ export default function ManualPage() {
     }
 
     const strokes = strokesRef.current;
+    const exportStrokes = resampleStrokesForExport(strokes, thicknessScale);
     const events: MouseEventItem[] = [];
-    for (let s = 0; s < strokes.length; s += 1) {
-      const stroke = strokes[s];
+    for (let s = 0; s < exportStrokes.length; s += 1) {
+      const stroke = exportStrokes[s];
       if (stroke.length === 0) {
         continue;
       }
@@ -738,6 +752,21 @@ export default function ManualPage() {
             accept="image/*"
             className="hidden"
             onChange={handleUploadChange}
+          />
+        </div>
+        <div className="flex w-full max-w-md items-center gap-3">
+          <label htmlFor="thickness-scale" className="text-sm text-zinc-700">
+            线宽强度: {thicknessScale.toFixed(1)}x
+          </label>
+          <input
+            id="thickness-scale"
+            type="range"
+            min={0.5}
+            max={2}
+            step={0.1}
+            value={thicknessScale}
+            onChange={(event) => setThicknessScale(Number(event.target.value))}
+            className="w-56"
           />
         </div>
 
